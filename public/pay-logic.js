@@ -1,5 +1,12 @@
 // pay-logic.js — хостится на Vercel, вся логика расширения
 // Загружается inject.js через <script src="..."> в MAIN world
+// Исправления:
+//  1. Атомарный снапшот вместо кучи несвязанных полей
+//  2. Единый deriveState() + renderButton() вместо дублированной логики
+//  3. Убран MutationObserver на весь документ (один setInterval)
+//  4. Флаг sending: кнопка не активируется во время полёта запроса
+//  5. Кнопка «Остаток»: busy-состояние и индикация ошибки
+//  6. Автозаполнение суммы, когда «Итого к оплате:» появляется после сохранения
 (() => {
   if (window.__lpPayLogicLoaded) return;
   window.__lpPayLogicLoaded = true;
@@ -10,14 +17,21 @@
   const API_HOST = 'genezis-platform-api.gnzs.ru/events';
 
   // ===== Состояние =====
-  let capturedData = {
-    lastEventIds: [],
-    lastParentId: null,
-    lastPostResponse: null,
-    lastGetUrl: null,
-    interceptedAt: null,
-  };
-  let needsSave = false;
+  // Атомарный снапшот: eventIds и parentId всегда принадлежат одной записи.
+  // GET с новым parentId открывает новый снапшот (старые ids сбрасываются),
+  // POST заполняет текущий снапшот (ids + postResponse).
+  // После оплаты снапшот НЕ чистится: аванс + доплата — штатный сценарий.
+  let captured = null;
+
+  // Процесс оплаты в полёте — блокирует перерисовку кнопки (fix #4)
+  let sending = false;
+  let avansBusy = false;
+  // Пользователь трогал поле суммы руками — автозаполнение больше не трогает его
+  let inputTouched = false;
+
+  // Временное сообщение на кнопке (успех/ошибка), автосброс через 2 сек
+  let feedback = null;
+  let feedbackTimer = null;
 
   // ===== Webhook-мост к content.js =====
   function callWebhook(endpoint, payload) {
@@ -54,6 +68,31 @@
     window.dispatchEvent(new CustomEvent('lifepay-intercept', { detail: { type, ...detail } }));
   }
 
+  function applyPostCapture(ids, response) {
+    captured = captured || {};
+    captured.eventIds = ids;
+    captured.postResponse = response;
+    captured.interceptedAt = new Date().toISOString();
+    dispatchIntercept('post', { ids, response });
+  }
+
+  function applyGetCapture(parentId, url) {
+    if (!captured || captured.parentId !== parentId) {
+      // Новая запись: старые ids не могут относиться к ней — сбрасываем
+      captured = {
+        parentId,
+        getUrl: url,
+        eventIds: [],
+        postResponse: null,
+        interceptedAt: new Date().toISOString(),
+      };
+    } else {
+      captured.getUrl = url;
+      captured.interceptedAt = new Date().toISOString();
+    }
+    dispatchIntercept('get', { parentId, url });
+  }
+
   // --- XHR ---
   const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
@@ -74,21 +113,11 @@
         try {
           const resp = JSON.parse(this.responseText);
           const ids = extractIds(resp);
-          if (ids.length > 0) {
-            capturedData.lastEventIds = ids;
-            capturedData.lastPostResponse = resp;
-            capturedData.interceptedAt = new Date().toISOString();
-            dispatchIntercept('post', { ids, response: resp });
-          }
+          if (ids.length > 0) applyPostCapture(ids, resp);
         } catch (e) {}
       } else if (this.__lpMethod === 'GET') {
         const match = url.match(/[?&]parentId=([^&]+)/);
-        if (match && match[1]) {
-          capturedData.lastParentId = match[1];
-          capturedData.lastGetUrl = url;
-          capturedData.interceptedAt = new Date().toISOString();
-          dispatchIntercept('get', { parentId: match[1], url });
-        }
+        if (match && match[1]) applyGetCapture(match[1], url);
       }
     });
     return origSend.apply(this, args);
@@ -106,147 +135,160 @@
         try {
           const data = await response.clone().json();
           const ids = extractIds(data);
-          if (ids.length > 0) {
-            capturedData.lastEventIds = ids;
-            capturedData.lastPostResponse = data;
-            capturedData.interceptedAt = new Date().toISOString();
-            dispatchIntercept('post', { ids, response: data });
-          }
+          if (ids.length > 0) applyPostCapture(ids, data);
         } catch (e) {}
       } else if (method === 'GET') {
         const match = url.match(/[?&]parentId=([^&]+)/);
-        if (match && match[1]) {
-          capturedData.lastParentId = match[1];
-          capturedData.lastGetUrl = url;
-          capturedData.interceptedAt = new Date().toISOString();
-          dispatchIntercept('get', { parentId: match[1], url });
-        }
+        if (match && match[1]) applyGetCapture(match[1], url);
       }
     }
     return response;
   };
 
-  // ===== UI =====
-  function checkSaveButton() {
-    const saveBtn = [...document.querySelectorAll('button')]
-      .find(b => b.textContent.trim() === 'Сохранить');
-    const wasVisible = needsSave;
-    needsSave = !!saveBtn;
-    if (wasVisible !== needsSave) updateButton();
+  // ===== UI: единый источник правды (fix #2) =====
+  function hasSaveButton() {
+    return [...document.querySelectorAll('button')]
+      .some(b => b.textContent.trim() === 'Сохранить');
   }
 
-  const saveObserver = new MutationObserver(() => checkSaveButton());
-  if (document.body || document.documentElement) {
-    saveObserver.observe(document.body || document.documentElement, {
-      childList: true,
-      subtree: true,
-    });
+  // ===== Диагностика (временный лог, пишет только при изменении состояния) =====
+  let lastLogSig = '';
+
+  function logDiagnostics(s) {
+    const buttons = [...document.querySelectorAll('button')]
+      .filter(b => b.textContent.trim() === 'Сохранить')
+      .map(b => ({
+        disabled: !!b.disabled,
+        visible: b.getClientRects().length > 0,
+        cls: (b.className || '').toString().slice(0, 60),
+        parentCls: (b.parentElement && b.parentElement.className || '').toString().slice(0, 60),
+      }));
+    const sig = JSON.stringify({ s, buttons });
+    if (sig === lastLogSig) return;
+    lastLogSig = sig;
+    console.log('[LP] state:', s, '| save-buttons:', buttons);
   }
-  checkSaveButton();
 
-  // Обновление кнопки при перехвате данных
-  window.addEventListener('lifepay-intercept', () => updateButton());
-
-  function updateButton() {
-    const btn = document.getElementById(BTN_ID);
-    if (!btn) return;
-
-    const hasData = (capturedData.lastEventIds && capturedData.lastEventIds.length > 0)
-                 || (capturedData.lastParentId && capturedData.lastParentId !== '0');
+  function deriveState() {
+    const hasData = !!captured
+      && ((captured.eventIds && captured.eventIds.length > 0)
+       || (captured.parentId && captured.parentId !== '0'));
     const amountInput = document.getElementById('lp-amount-input');
     const inputVal = amountInput ? amountInput.value.trim() : '';
     const hasAmount = inputVal !== '' && parseInt(inputVal, 10) > 0;
-
-    if (needsSave) {
-      btn.textContent = 'Сохраните запись';
-      btn.style.background = '#aaa';
-      btn.style.cursor = 'not-allowed';
-      btn.style.opacity = '0.6';
-      btn.disabled = true;
-    } else if (hasData && hasAmount) {
-      btn.textContent = 'Принять оплату';
-      btn.style.background = '#1cbf72';
-      btn.style.cursor = 'pointer';
-      btn.style.opacity = '1';
-      btn.disabled = false;
-    } else {
-      btn.textContent = 'Сохраните запись';
-      btn.style.background = '#aaa';
-      btn.style.cursor = 'not-allowed';
-      btn.style.opacity = '0.6';
-      btn.disabled = true;
-    }
+    const needsSave = hasSaveButton();
+    return {
+      hasData,
+      hasAmount,
+      needsSave,
+      canPay: !sending && hasData && hasAmount && !needsSave,
+    };
   }
 
-  async function handlePayClick() {
+  function showFeedback(text, color) {
+    clearTimeout(feedbackTimer);
+    feedback = { text, color };
+    renderButton();
+    feedbackTimer = setTimeout(() => {
+      feedback = null;
+      renderButton();
+    }, 2000);
+  }
+
+  function renderButton() {
     const btn = document.getElementById(BTN_ID);
     if (!btn) return;
 
-    const hasData = (capturedData.lastEventIds && capturedData.lastEventIds.length > 0)
-                 || (capturedData.lastParentId && capturedData.lastParentId !== '0');
-    if (!hasData) {
-      btn.textContent = 'Нет данных';
-      btn.style.background = '#f0ad4e';
-      setTimeout(() => updateButton(), 2000);
-      return;
+    let text = 'Сохраните запись';
+    let bg = '#aaa';
+    let cursor = 'not-allowed';
+    let opacity = '0.6';
+    let disabled = true;
+
+    if (sending) {
+      text = 'Отправка...';
+      bg = '#3788d8';
+      cursor = 'wait';
+      opacity = '0.7';
+    } else if (feedback) {
+      text = feedback.text;
+      bg = feedback.color;
+    } else {
+      const s = deriveState();
+      logDiagnostics(s);
+      if (s.canPay) {
+        text = 'Принять оплату';
+        bg = '#1cbf72';
+        cursor = 'pointer';
+        opacity = '1';
+        disabled = false;
+      }
     }
 
-    const amountInput = document.getElementById('lp-amount-input');
-    const inputVal = amountInput ? amountInput.value.trim() : '';
-    if (inputVal === '' || parseInt(inputVal, 10) <= 0) {
-      btn.textContent = 'Укажите сумму';
-      btn.style.background = '#f0ad4e';
-      setTimeout(() => updateButton(), 2000);
-      return;
-    }
+    btn.textContent = text;
+    btn.style.background = bg;
+    btn.style.cursor = cursor;
+    btn.style.opacity = opacity;
+    btn.disabled = disabled;
+  }
 
-    const eventIds = capturedData.lastEventIds || [];
-    const parentId = capturedData.lastParentId;
-    const amount = parseInt(inputVal, 10);
+  // Перерисовка при новых перехваченных данных (сама кнопка учтёт sending)
+  window.addEventListener('lifepay-intercept', () => renderButton());
+
+  async function handlePayClick() {
+    const btn = document.getElementById(BTN_ID);
+    if (!btn || sending) return;
+
+    const s = deriveState();
+    if (!s.hasData) { showFeedback('Нет данных', '#f0ad4e'); return; }
+    if (!s.hasAmount) { showFeedback('Укажите сумму', '#f0ad4e'); return; }
+    if (s.needsSave) { showFeedback('Сначала сохраните', '#f0ad4e'); return; }
+
+    const eventIds = captured.eventIds || [];
+    const parentId = captured.parentId;
+    const amount = parseInt(document.getElementById('lp-amount-input').value.trim(), 10);
 
     const payload = {
       event_id: eventIds.length > 0 ? eventIds[0] : parentId,
       sum_to_pay: amount,
-      post_response: capturedData.lastPostResponse,
-      get_url: capturedData.lastGetUrl,
-      intercepted_at: capturedData.interceptedAt,
+      post_response: captured.postResponse,
+      get_url: captured.getUrl,
+      intercepted_at: captured.interceptedAt,
       iframe_url: window.location.href,
     };
 
-    btn.textContent = 'Отправка...';
-    btn.disabled = true;
-    btn.style.opacity = '0.7';
-    btn.style.cursor = 'wait';
+    sending = true;
+    renderButton();
 
     const result = await callWebhook(WEBHOOK_PAY, payload);
+    sending = false;
 
-    if (result.ok) {
-      btn.textContent = 'Оплата оформлена';
-      btn.style.background = '#1cbf72';
-    } else {
-      btn.textContent = 'Ошибка';
-      btn.style.background = '#f26252';
-    }
+    if (result.ok) showFeedback('Оплата оформлена', '#1cbf72');
+    else showFeedback('Ошибка', '#f26252');
+  }
 
-    setTimeout(() => {
-      btn.disabled = false;
-      btn.style.opacity = '1';
-      btn.style.cursor = 'pointer';
-      updateButton();
-    }, 3000);
+  // Кнопка «Остаток»: busy-состояние + индикация ошибки (fix #5)
+  function restoreAvansButton(btn, originalText) {
+    btn.textContent = originalText;
+    btn.style.color = '#3788d8';
+    btn.style.borderColor = '#3788d8';
+    btn.disabled = false;
   }
 
   async function handleAvansClick(btn) {
-    const eventIds = capturedData.lastEventIds || [];
-    const parentId = capturedData.lastParentId;
+    if (avansBusy || sending) return;
+    const eventIds = captured ? captured.eventIds || [] : [];
+    const parentId = captured ? captured.parentId : null;
     const event_id = eventIds.length > 0 ? eventIds[0] : parentId;
     if (!event_id) return;
 
     const originalText = btn.textContent;
+    avansBusy = true;
     btn.textContent = 'Загрузка...';
     btn.disabled = true;
 
     const result = await callWebhook(WEBHOOK_AVANS, { event_id });
+    avansBusy = false;
 
     if (result.ok && result.data) {
       const data = result.data;
@@ -254,12 +296,15 @@
       const input = document.getElementById('lp-amount-input');
       if (amount && !isNaN(amount) && input) {
         input.value = amount;
-        updateButton();
+        renderButton();
       }
+      restoreAvansButton(btn, originalText);
+    } else {
+      btn.textContent = 'Ошибка';
+      btn.style.color = '#f26252';
+      btn.style.borderColor = '#f26252';
+      setTimeout(() => restoreAvansButton(btn, originalText), 2000);
     }
-
-    btn.textContent = originalText;
-    btn.disabled = false;
   }
 
   function getTotalToPay() {
@@ -275,6 +320,20 @@
       }
     }
     return 0;
+  }
+
+  // Автозаполнение суммы: в create-режиме «Итого к оплате:» появляется
+  // только после сохранения сделки — подставляем его, пока поле пустое
+  function autoFillAmount() {
+    const input = document.getElementById('lp-amount-input');
+    if (!input || inputTouched) return;
+    if (input.value.trim() !== '') return;
+    const total = getTotalToPay();
+    if (total > 0) {
+      input.value = total;
+      console.log('[LP] autofill amount:', total);
+      renderButton();
+    }
   }
 
   function createPaymentBlock(anchor) {
@@ -293,7 +352,7 @@
     input.style.cssText = 'flex:0 0 38%;padding:8px 10px;border:1px solid #ccc;border-radius:4px;font-size:13px;outline:none;';
     input.addEventListener('focus', () => { input.style.borderColor = '#3788d8'; });
     input.addEventListener('blur', () => { input.style.borderColor = '#ccc'; });
-    input.addEventListener('input', updateButton);
+    input.addEventListener('input', () => { inputTouched = true; renderButton(); });
 
     const btn30 = document.createElement('button');
     btn30.textContent = '30%';
@@ -304,7 +363,7 @@
       const val = getTotalToPay();
       if (val > 0) {
         input.value = Math.round(val * 0.3);
-        updateButton();
+        renderButton();
       }
     };
 
@@ -327,7 +386,7 @@
 
     wrapper.append(inputRow, btn);
     anchor.after(wrapper);
-    updateButton();
+    renderButton();
   }
 
   function injectUI() {
@@ -340,9 +399,10 @@
     return true;
   }
 
-  // Старт
+  // Старт: один цикл вместо MutationObserver + setInterval (fix #3)
   setInterval(() => {
     injectUI();
-    checkSaveButton();
+    autoFillAmount();
+    renderButton();
   }, 500);
 })();
