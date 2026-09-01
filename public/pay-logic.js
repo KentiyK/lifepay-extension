@@ -10,6 +10,7 @@
 (() => {
   if (window.__lpPayLogicLoaded) return;
   window.__lpPayLogicLoaded = true;
+  console.log('[LP] pay-logic.js loaded, url:', window.location.href);
 
   const BTN_ID = 'lp-pay-btn';
   const WEBHOOK_PAY = 'https://n8n18297.hostkey.in/webhook/testik';
@@ -199,6 +200,7 @@
     const btn = document.getElementById(BTN_ID);
     if (!btn) return;
 
+    const s = deriveState();
     let text = 'Сохраните запись';
     let bg = '#aaa';
     let cursor = 'not-allowed';
@@ -214,7 +216,6 @@
       text = feedback.text;
       bg = feedback.color;
     } else {
-      const s = deriveState();
       logDiagnostics(s);
       if (s.canPay) {
         text = 'Принять оплату';
@@ -308,7 +309,8 @@
   }
 
   function getTotalToPay() {
-    const rows = document.querySelectorAll('._row_1ki2i_27');
+    const rows = document.querySelectorAll('[class*="_row_"]');
+    console.log('[LP] getTotalToPay: rows found=', rows.length);
     for (const row of rows) {
       const label = row.querySelector('div:first-child');
       if (label && label.textContent.trim() === 'Итого к оплате:') {
@@ -337,6 +339,7 @@
   }
 
   function createPaymentBlock(anchor) {
+    console.log('[LP] createPaymentBlock: anchor=', anchor);
     const wrapper = document.createElement('div');
     wrapper.id = 'lp-pay-wrapper';
     wrapper.style.cssText = 'margin:12px 0;display:flex;flex-direction:column;gap:8px;';
@@ -391,18 +394,24 @@
 
   function injectUI() {
     if (document.getElementById(BTN_ID)) return true;
-    const table = document.querySelector('._table_jl8j9_21');
+    const table = document.querySelector('[class*="_table_"]');
+    console.log('[LP] injectUI: table=', table);
     if (!table) return false;
-    const footer = table.closest('._orderForm_mn78f_1')?.querySelector('._footer_1ki2i_1');
+    const orderForm = table.closest('[class*="_orderForm_"]');
+    console.log('[LP] injectUI: orderForm=', orderForm);
+    const footer = orderForm?.querySelector('[class*="_footer_"]');
+    console.log('[LP] injectUI: footer=', footer);
     const anchor = footer || table;
     createPaymentBlock(anchor);
     return true;
   }
 
   // Старт: один цикл вместо MutationObserver + setInterval (fix #3)
+  console.log('[LP] starting setInterval, document.readyState:', document.readyState);
   setInterval(() => {
-    injectUI();
+    const injected = injectUI();
     autoFillAmount();
     renderButton();
+    console.log('[LP] tick: injectUI=', injected, 'captured=', !!captured, 'btnExists=', !!document.getElementById(BTN_ID));
   }, 500);
 })();
